@@ -5,7 +5,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import json
+import yaml
 import logging
+import uuid
 from datetime import datetime
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
@@ -15,22 +17,39 @@ from sensor_msgs.msg import Imu, BatteryState, NavSatFix
 from mavros_msgs.msg import State, VfrHud
 from geometry_msgs.msg import PoseStamped, TwistStamped
 
-
 class DroneKafkaPublisher(Node):
     def __init__(self):
         super().__init__('drone_kafka_publisher')
+        self.load_config()
+        self.simulation_id = self.generate_simulation_id()
+        self.sequence_number = 0
         self.setup_logging()
         self.setup_kafka_producer()
         self.producer_lock = Lock()
         self.setup_subscribers()
-        self.get_logger().info("DroneKafkaPublisher initialized and ready to publish data")
+        self.get_logger().info(f"Started new simulation with ID: {self.simulation_id}")
+
+    def load_config(self):
+        config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
+        with open(config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
+
+    def generate_simulation_id(self):
+        """시뮬레이션 고유 ID 생성"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        unique_id = uuid.uuid4().hex[:8]
+        return f"sim_{timestamp}_{unique_id}"
 
     def setup_logging(self):
-        current_path = os.getcwd()
-        log_path = os.path.join(current_path, 'logs')
+        log_path = os.path.join(os.path.dirname(__file__), 'logs')
         if not os.path.exists(log_path):
             os.makedirs(log_path)
-        log_file = os.path.join(log_path, f'drone_producer_{datetime.now().strftime("%Y%m%d")}.log')
+            
+        log_file = os.path.join(
+            log_path, 
+            f'drone_producer_{self.simulation_id}.log'
+        )
+        
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -43,63 +62,91 @@ class DroneKafkaPublisher(Node):
 
     def setup_kafka_producer(self):
         self.kafka_config = {
-            'bootstrap_servers': [
-                'kafka01:9093',
-                'kafka02:9093',
-                'kafka03:9093'
-            ],
+            'bootstrap_servers': self.config['kafka']['bootstrap_servers'],
             'client_id': f'drone_producer_{socket.gethostname()}',
-            'acks': 'all',
-            'retries': 5,
-            'retry_backoff_ms': 1000,
-            'compression_type': 'gzip',
+            'acks': 'all',                    
+            'retries': 5,                     
+            'retry_backoff_ms': 1000,        
+            'compression_type': 'gzip',        
             'key_serializer': lambda x: x.encode('utf-8'),
-            'value_serializer': lambda x: json.dumps(x, default=str).encode('utf-8')
+            'value_serializer': lambda x: json.dumps(x, default=str).encode('utf-8'),
+            'request_timeout_ms': 30000,      
+            'max_block_ms': 60000,            
+            'batch_size': 16384,              
+            'linger_ms': 50                  
         }
+
         try:
             self.producer = KafkaProducer(**self.kafka_config)
-            self.logger.info("Kafka Producer initialized successfully")
+            self.logger.info(f"Kafka Producer initialized for simulation {self.simulation_id}")
         except KafkaError as e:
             self.logger.error(f"Failed to initialize Kafka Producer: {e}")
             raise
 
+    def create_message(self, topic, data):
+        """메시지에 시뮬레이션 ID와 시퀀스 번호 추가"""
+        self.sequence_number += 1
+        return {
+            'simulation_id': self.simulation_id,
+            'sequence': self.sequence_number,
+            'timestamp': datetime.utcnow().isoformat(),
+            'topic': topic,
+            'data': data
+        }
+
     def send_data(self, topic, data):
         try:
-            key = str(datetime.utcnow().timestamp())
+            message = self.create_message(topic, data)
+            key = f"{self.simulation_id}_{self.sequence_number}"
+            
             with self.producer_lock:
-                self.logger.info(f"Sending data to Kafka topic '{topic}': {data}")
                 future = self.producer.send(
-                    topic,
+                    topic=topic,
                     key=key,
-                    value=data,
+                    value=message,
                     timestamp_ms=int(datetime.utcnow().timestamp() * 1000)
                 )
-                future.get(timeout=10)
-                self.producer.flush(timeout=5)
-                self.logger.info(f"Data sent to topic '{topic}' successfully")
+                
+                record_metadata = future.get(timeout=10)
+                self.logger.debug(
+                    f"Sent data to {topic} partition {record_metadata.partition} "
+                    f"offset {record_metadata.offset}"
+                )
                 return True
-        except KafkaError as e:
-            self.logger.error(f"Error sending data to topic '{topic}': {e}")
+                
+        except Exception as e:
+            self.logger.error(f"Error sending data to {topic}: {e}")
             return False
 
     def setup_subscribers(self):
         qos_profile = QoSProfile(
-        reliability=ReliabilityPolicy.BEST_EFFORT,  
-        durability=DurabilityPolicy.VOLATILE,       
-        history=HistoryPolicy.KEEP_LAST,
-        depth=10
-    )
-        self.create_subscription(Imu, '/mavros/imu/data', self.imu_callback, qos_profile)
-        self.create_subscription(BatteryState, '/mavros/battery', self.battery_callback, qos_profile)
-        self.create_subscription(VfrHud, '/mavros/vfr_hud', self.vfr_callback, qos_profile)
-        self.create_subscription(PoseStamped, '/mavros/local_position/pose', self.local_pose_callback, qos_profile)
-        self.create_subscription(NavSatFix, '/mavros/global_position/global', self.global_position_callback, qos_profile)
-        self.create_subscription(TwistStamped, '/mavros/local_position/velocity_local', self.velocity_callback, qos_profile)
-        self.create_subscription(State, '/mavros/state', self.state_callback, qos_profile)
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        # ROS2 subscribers setup
+        self.create_subscription(
+            Imu, '/mavros/imu/data', self.imu_callback, qos_profile)
+        self.create_subscription(
+            BatteryState, '/mavros/battery', self.battery_callback, qos_profile)
+        self.create_subscription(
+            VfrHud, '/mavros/vfr_hud', self.vfr_callback, qos_profile)
+        self.create_subscription(
+            PoseStamped, '/mavros/local_position/pose', 
+            self.local_pose_callback, qos_profile)
+        self.create_subscription(
+            NavSatFix, '/mavros/global_position/global', 
+            self.global_position_callback, qos_profile)
+        self.create_subscription(
+            TwistStamped, '/mavros/local_position/velocity_local', 
+            self.velocity_callback, qos_profile)
+        self.create_subscription(
+            State, '/mavros/state', self.state_callback, qos_profile)
 
     def imu_callback(self, msg):
         imu_data = {
-            'timestamp': datetime.utcnow().isoformat(),
             'orientation': {
                 'x': msg.orientation.x,
                 'y': msg.orientation.y,
@@ -121,7 +168,6 @@ class DroneKafkaPublisher(Node):
 
     def battery_callback(self, msg):
         battery_data = {
-            'timestamp': datetime.utcnow().isoformat(),
             'voltage': msg.voltage,
             'current': msg.current,
             'percentage': msg.percentage
@@ -130,7 +176,6 @@ class DroneKafkaPublisher(Node):
 
     def vfr_callback(self, msg):
         vfr_data = {
-            'timestamp': datetime.utcnow().isoformat(),
             'airspeed': msg.airspeed,
             'groundspeed': msg.groundspeed,
             'altitude': msg.altitude
@@ -139,7 +184,6 @@ class DroneKafkaPublisher(Node):
 
     def local_pose_callback(self, msg):
         pose_data = {
-            'timestamp': datetime.utcnow().isoformat(),
             'position': {
                 'x': msg.pose.position.x,
                 'y': msg.pose.position.y,
@@ -156,7 +200,6 @@ class DroneKafkaPublisher(Node):
 
     def global_position_callback(self, msg):
         position_data = {
-            'timestamp': datetime.utcnow().isoformat(),
             'latitude': msg.latitude,
             'longitude': msg.longitude,
             'altitude': msg.altitude
@@ -165,13 +208,12 @@ class DroneKafkaPublisher(Node):
 
     def velocity_callback(self, msg):
         velocity_data = {
-            'timestamp': datetime.utcnow().isoformat(),
-            'linear_velocity': {
+            'linear': {
                 'x': msg.twist.linear.x,
                 'y': msg.twist.linear.y,
                 'z': msg.twist.linear.z
             },
-            'angular_velocity': {
+            'angular': {
                 'x': msg.twist.angular.x,
                 'y': msg.twist.angular.y,
                 'z': msg.twist.angular.z
@@ -181,7 +223,6 @@ class DroneKafkaPublisher(Node):
 
     def state_callback(self, msg):
         state_data = {
-            'timestamp': datetime.utcnow().isoformat(),
             'connected': msg.connected,
             'armed': msg.armed,
             'mode': msg.mode
@@ -189,8 +230,10 @@ class DroneKafkaPublisher(Node):
         self.send_data('drone_state', state_data)
 
     def shutdown(self):
+        """Cleanup on shutdown"""
         if hasattr(self, 'producer'):
-            self.logger.info("Shutting down Kafka Producer")
+            self.logger.info(f"Shutting down producer for simulation {self.simulation_id}")
+            self.producer.flush()
             self.producer.close()
 
 def main(args=None):
