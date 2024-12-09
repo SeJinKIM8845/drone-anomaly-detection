@@ -1,0 +1,60 @@
+# InfluxDB 연결 설정
+influxdb:
+  url: "http://localhost:8086"
+  token: "your_influxdb_token"    # InfluxDB 토큰으로 변경 필요
+  org: "your_organization"        # 조직 이름으로 변경 필요
+  bucket: "drone_data"            # 버킷 이름으로 변경 필요
+  retention_policy: "30d"         # 데이터 보존 기간
+
+# 전처리 파라미터 설정
+preprocessing:
+  # 기본 파라미터
+  sampling_rate: 100              # 데이터 샘플링 주기 (Hz)
+  chunk_size: 100000             # 한 번에 처리할 데이터 수
+  sequence_length: 100           # LSTM 입력 시퀀스 길이
+  
+  # 특성 추출 설정
+  features:
+    vibration:
+      window_size: 100           # 진동 분석용 윈도우 크기
+      use_fft: true             # FFT 특성 사용 여부
+      min_periods: 1            # 최소 필요 데이터 포인트 수
+      frequency_range:
+        min: 0.1                # 최소 주파수 (Hz)
+        max: 50.0               # 최대 주파수 (Hz)
+      
+    battery:
+      window_size: 100          # 배터리 분석용 윈도우 크기
+      min_periods: 1            # 최소 필요 데이터 포인트 수
+      voltage_range:            # 정상 전압 범위
+        min: 10.0               # 최소 전압 (V)
+        max: 25.0               # 최대 전압 (V)
+      current_range:            # 정상 전류 범위
+        min: -100.0             # 최소 전류 (A)
+        max: 100.0              # 최대 전류 (A)
+
+  # 결측치 처리 설정
+  missing_values:
+    method: ["ffill", "bfill"]  # 결측치 처리 방법
+    fill_value: 0               # 최종 채움값
+
+# 출력 설정
+output:
+  directory: "processed_data"    # 처리된 데이터 저장 경로
+  format: "npy"                 # 저장 포맷 (npy)
+  compress: true                # 데이터 압축 사용 여부
+  save_scaler: true            # 스케일러 저장 여부
+
+# 로깅 설정
+logging:
+  level: "INFO"                 # 로깅 레벨 (DEBUG, INFO, WARNING, ERROR)
+  directory: "logs"             # 로그 파일 저장 경로
+  format: "%(asctime)s - %(levelname)s - %(message)s"
+  max_size: 10485760           # 최대 로그 파일 크기 (10MB)
+  backup_count: 5              # 보관할 로그 파일 수
+
+# 성능 최적화 설정
+performance:
+  use_multiprocessing: false    # 멀티프로세싱 사용 여부
+  n_jobs: -1                   # 사용할 CPU 코어 수 (-1: 모든 코어)
+  chunk_overlap: 10            # 청크 간 중복 데이터 포인트 수

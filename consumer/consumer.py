@@ -17,8 +17,8 @@ class DroneDataConsumer:
         self.setup_influxdb_client()
 
     def load_config(self):
-        """Load configuration from config.yaml."""
-        config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
+        """Load configuration from consumer_config.yaml."""
+        config_path = os.path.join(os.path.dirname(__file__), 'consumer_config.yaml')
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
@@ -59,6 +59,19 @@ class DroneDataConsumer:
         self.bucket = self.config['influxdb']['bucket']
         self.logger.info("InfluxDB client initialized")
 
+    def convert_timestamp_to_influxdb_format(self, timestamp):
+        """
+        Convert the given timestamp to InfluxDB-compatible ISO 8601 format.
+        """
+        try:
+            # Parse the timestamp with timezone information
+            dt = datetime.fromisoformat(timestamp.replace("Z", ""))
+            # Format as ISO 8601 with microseconds and timezone
+            return dt.isoformat()
+        except ValueError as e:
+            self.logger.error(f"Timestamp conversion error: {e}")
+            raise
+
     def write_to_influxdb(self, topic, message):
         """
         Write a Kafka message to InfluxDB.
@@ -66,12 +79,14 @@ class DroneDataConsumer:
         :param message: The message received from Kafka.
         """
         try:
+            # Convert the timestamp to InfluxDB-compatible format
+            influx_timestamp = self.convert_timestamp_to_influxdb_format(message["timestamp"])
             point = Point(topic)\
                 .tag("simulation_id", message["simulation_id"])\
-                .time(message["timestamp"], WritePrecision.NS)
+                .time(influx_timestamp, WritePrecision.NS)
 
             for key, value in message["data"].items():
-                if isinstance(value, dict):  # Handle nested fields (IMU specific)
+                if isinstance(value, dict):  # Handle nested fields (e.g., IMU data)
                     for sub_key, sub_value in value.items():
                         if isinstance(sub_value, (int, float, str, bool)):
                             point.field(f"{key}_{sub_key}", sub_value)

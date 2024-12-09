@@ -16,7 +16,6 @@ from sensor_msgs.msg import Imu, BatteryState, NavSatFix
 from mavros_msgs.msg import State, VfrHud
 from geometry_msgs.msg import PoseStamped, TwistStamped
 
-
 class DroneKafkaPublisher(Node):
     def __init__(self):
         super().__init__('drone_kafka_publisher')
@@ -29,7 +28,7 @@ class DroneKafkaPublisher(Node):
         self.get_logger().info(f"Started new simulation with ID: {self.simulation_id}")
 
     def load_config(self):
-        config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
+        config_path = os.path.join(os.path.dirname(__file__), 'producer_config.yaml')
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
