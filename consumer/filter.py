@@ -1,271 +1,278 @@
-#!/usr/bin/env python3
-
-import numpy as np
 import pandas as pd
-from influxdb_client import InfluxDBClient
-from scipy import signal
-from sklearn.preprocessing import MinMaxScaler
-import yaml
-import logging
-import os
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+import numpy as np
 import json
+from influxdb_client import InfluxDBClient
+from sklearn.preprocessing import MinMaxScaler
+from datetime import datetime
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import Tuple, Optional
 
 class DroneDataFilter:
-    def __init__(self, config_path: str = 'filter_config.yaml'):
-        """드론 데이터 전처리 클래스 초기화"""
-        self.load_config(config_path)
-        self.setup_logging()
-        self.setup_influxdb()
-        self.setup_scalers()
-        
-    def load_config(self, config_path: str) -> None:
-        """설정 파일 로드"""
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-            
-        # 주요 파라미터 설정
-        self.bucket = self.config['influxdb']['bucket']
-        self.sampling_rate = self.config['preprocessing']['sampling_rate']
-        self.chunk_size = self.config['preprocessing']['chunk_size']
-        self.sequence_length = self.config['preprocessing']['sequence_length']
-        
-    def setup_logging(self) -> None:
-        """로깅 설정"""
-        log_dir = Path(self.config['logging']['directory'])
-        log_dir.mkdir(exist_ok=True)
-        
-        log_file = log_dir / f'filter_{datetime.now():%Y%m%d_%H%M%S}.log'
-        
-        logging.basicConfig(
-            level=self.config['logging']['level'],
-            format=self.config['logging']['format'],
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler(str(log_file))
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-        
-    def setup_influxdb(self) -> None:
-        """InfluxDB 연결 설정"""
-        try:
-            self.client = InfluxDBClient(
-                url=self.config['influxdb']['url'],
-                token=self.config['influxdb']['token'],
-                org=self.config['influxdb']['org']
-            )
-            self.query_api = self.client.query_api()
-            self.logger.info("Successfully connected to InfluxDB")
-        except Exception as e:
-            self.logger.error(f"Failed to connect to InfluxDB: {str(e)}")
-            raise
-            
-    def setup_scalers(self) -> None:
-        """데이터 스케일러 초기화"""
-        self.scaler = MinMaxScaler()
-        self.logger.info("Initialized MinMaxScaler")
+   def __init__(self):
+       # InfluxDB 설정
+       self.INFLUXDB_URL = "http://3.37.135.231:8086"
+       self.INFLUXDB_TOKEN = "your_token"
+       self.INFLUXDB_ORG = "drone_org"
+       self.INFLUXDB_BUCKET = "drone_data"
+       self.client = InfluxDBClient(
+           url=self.INFLUXDB_URL,
+           token=self.INFLUXDB_TOKEN,
+           org=self.INFLUXDB_ORG
+       )
+       
+       # 스케일러와 윈도우 설정
+       self.imu_scaler = MinMaxScaler()
+       self.path_scaler = MinMaxScaler()
+       self.window_size = 50
+       self.batch_size = 1000
+       
+       # 로깅 설정
+       self.setup_logging()
+       self.load_scaler_params()
 
-    def fetch_data_chunk(self, measurement: str, start_time: str, end_time: str) -> pd.DataFrame:
-        """지정된 시간 범위의 데이터 청크 조회"""
-        try:
-            query = f'''
-            from(bucket: "{self.bucket}")
-                |> range(start: {start_time}, stop: {end_time})
-                |> filter(fn: (r) => r["_measurement"] == "{measurement}")
-            '''
-            df = self.query_api.query_data_frame(query)
-            if df.empty:
-                self.logger.warning(f"No data found for {measurement} between {start_time} and {end_time}")
-                return pd.DataFrame()
-            return df
-        except Exception as e:
-            self.logger.error(f"Error fetching data chunk: {str(e)}")
-            raise
+   def setup_logging(self):
+       """로깅 설정"""
+       logging.basicConfig(
+           level=logging.INFO,
+           format='%(asctime)s - %(levelname)s - %(message)s',
+           handlers=[
+               logging.FileHandler('drone_filter.log'),
+               logging.StreamHandler()
+           ]
+       )
+       self.logger = logging.getLogger(__name__)
 
-    def extract_vibration_features(self, imu_data: pd.DataFrame) -> pd.DataFrame:
-        """진동 관련 특성 추출"""
-        if imu_data.empty:
-            return pd.DataFrame()
-            
-        features = pd.DataFrame(index=imu_data.index)
-        
-        # 각속도와 가속도 magnitude 계산
-        angular_vel = np.sqrt(
-            imu_data['angular_velocity_x']**2 +
-            imu_data['angular_velocity_y']**2 +
-            imu_data['angular_velocity_z']**2
-        )
-        
-        accel = np.sqrt(
-            imu_data['linear_acceleration_x']**2 +
-            imu_data['linear_acceleration_y']**2 +
-            imu_data['linear_acceleration_z']**2
-        )
-        
-        window = self.config['preprocessing']['features']['vibration']['window_size']
-        
-        # 기본 통계 특성
-        features['angular_vel_mean'] = angular_vel.rolling(window=window, min_periods=1).mean()
-        features['angular_vel_std'] = angular_vel.rolling(window=window, min_periods=1).std()
-        features['accel_mean'] = accel.rolling(window=window, min_periods=1).mean()
-        features['accel_std'] = accel.rolling(window=window, min_periods=1).std()
-        
-        # 주파수 도메인 특성 계산
-        if self.config['preprocessing']['features']['vibration']['use_fft']:
-            freqs, psd = signal.welch(angular_vel.fillna(0), fs=self.sampling_rate)
-            features['dominant_freq'] = freqs[np.argmax(psd)]
-            features['spectral_energy'] = np.sum(psd)
-            
-        return features
+   def load_scaler_params(self):
+       """스케일러 파라미터 로드"""
+       try:
+           with open("scaler_params.json", "r") as f:
+               params = json.load(f)
+               self.imu_scaler.min_ = np.array(params["imu"]["min"])
+               self.imu_scaler.scale_ = np.array(params["imu"]["scale"])
+               self.path_scaler.min_ = np.array(params["path"]["min"])
+               self.path_scaler.scale_ = np.array(params["path"]["scale"])
+               self.logger.info("Scaler parameters loaded successfully")
+       except FileNotFoundError:
+           self.logger.warning("Scaler parameters not found. Initializing new scalers.")
 
-    def extract_battery_features(self, battery_data: pd.DataFrame) -> pd.DataFrame:
-        """배터리 관련 특성 추출"""
-        if battery_data.empty:
-            return pd.DataFrame()
-            
-        features = pd.DataFrame(index=battery_data.index)
-        window = self.config['preprocessing']['features']['battery']['window_size']
-        
-        # 기본 특성
-        features['voltage'] = battery_data['voltage']
-        features['current'] = battery_data['current']
-        features['power'] = battery_data['voltage'] * battery_data['current']
-        
-        # 변화율 특성
-        features['voltage_change'] = battery_data['voltage'].diff()
-        features['current_change'] = battery_data['current'].diff()
-        
-        # 통계 특성
-        features['voltage_ma'] = battery_data['voltage'].rolling(window=window, min_periods=1).mean()
-        features['voltage_std'] = battery_data['voltage'].rolling(window=window, min_periods=1).std()
-        features['current_ma'] = battery_data['current'].rolling(window=window, min_periods=1).mean()
-        features['current_std'] = battery_data['current'].rolling(window=window, min_periods=1).std()
-        
-        return features
+   def save_scaler_params(self):
+       """스케일러 파라미터 저장"""
+       params = {
+           "imu": {
+               "min": self.imu_scaler.min_.tolist(),
+               "scale": self.imu_scaler.scale_.tolist()
+           },
+           "path": {
+               "min": self.path_scaler.min_.tolist(),
+               "scale": self.path_scaler.scale_.tolist()
+           }
+       }
+       with open("scaler_params.json", "w") as f:
+           json.dump(params, f)
+       self.logger.info("Scaler parameters saved successfully")
 
-    def preprocess_chunk(self, imu_data: pd.DataFrame, battery_data: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
-        """데이터 청크 전처리"""
-        # 특성 추출
-        imu_features = self.extract_vibration_features(imu_data)
-        battery_features = self.extract_battery_features(battery_data)
-        
-        # 특성 통합
-        all_features = pd.concat([imu_features, battery_features], axis=1)
-        
-        # 결측치 처리
-        all_features = all_features.fillna(method='ffill').fillna(method='bfill').fillna(0)
-        
-        # 정규화
-        scaled_data = self.scaler.fit_transform(all_features)
-        
-        return scaled_data, all_features.columns.tolist()
+   def fetch_data(self, simulation_id: Optional[str] = None, hours: int = 12) -> pd.DataFrame:
+       """InfluxDB에서 데이터 조회"""
+       query = f"""
+       from(bucket: "{self.INFLUXDB_BUCKET}")
+         |> range(start: -{hours}h)
+         |> filter(fn: (r) => r["_field"] in [
+             "linear_acceleration_x", "linear_acceleration_y", "linear_acceleration_z",
+             "angular_velocity_x", "angular_velocity_y", "angular_velocity_z",
+             "position_x", "position_y", "position_z"
+         ])
+       """
+       if simulation_id:
+           query += f'  |> filter(fn: (r) => r["simulation_id"] == "{simulation_id}")'
+       
+       try:
+           tables = self.client.query_api().query(query)
+           df = self._tables_to_dataframe(tables)
+           df['value'].fillna(0, inplace=True)
+           self.logger.info(f"Successfully fetched {len(df)} records")
+           return df
+       except Exception as e:
+           self.logger.error(f"Error fetching data: {str(e)}", exc_info=True)
+           raise
 
-    def create_sequences(self, data: np.ndarray) -> np.ndarray:
-        """LSTM 시퀀스 생성"""
-        sequences = []
-        for i in range(len(data) - self.sequence_length + 1):
-            seq = data[i:i+self.sequence_length]
-            sequences.append(seq)
-        return np.array(sequences)
+   def _tables_to_dataframe(self, tables) -> pd.DataFrame:
+       """InfluxDB 결과를 DataFrame으로 변환"""
+       data = []
+       for table in tables:
+           for record in table.records:
+               data.append({
+                   'timestamp': record.get_time(),
+                   'measurement': record.get_measurement(),
+                   'field': record.get_field(),
+                   'value': record.get_value(),
+                   'simulation_id': record.values.get('simulation_id')
+               })
+       return pd.DataFrame(data)
 
-    def process_time_range(self, start_time: str, end_time: str) -> None:
-        """시간 범위 데이터 처리"""
-        try:
-            self.logger.info(f"Processing data from {start_time} to {end_time}")
-            current_time = pd.Timestamp(start_time)
-            end_time = pd.Timestamp(end_time)
-            
-            all_sequences = []
-            feature_names = None
-            
-            # 청크 단위로 처리
-            while current_time < end_time:
-                next_time = min(
-                    current_time + pd.Timedelta(seconds=self.chunk_size/self.sampling_rate),
-                    end_time
-                )
-                
-                # 청크 데이터 조회
-                imu_data = self.fetch_data_chunk("drone_imu", 
-                    current_time.isoformat(), 
-                    next_time.isoformat()
-                )
-                battery_data = self.fetch_data_chunk("drone_battery",
-                    current_time.isoformat(),
-                    next_time.isoformat()
-                )
-                
-                # 데이터 처리
-                if not (imu_data.empty or battery_data.empty):
-                    scaled_data, feature_names = self.preprocess_chunk(imu_data, battery_data)
-                    sequences = self.create_sequences(scaled_data)
-                    all_sequences.append(sequences)
-                
-                current_time = next_time
-                self.logger.info(f"Processed chunk until {current_time}")
-            
-            if all_sequences:
-                # 모든 시퀀스 통합
-                final_sequences = np.concatenate(all_sequences, axis=0)
-                
-                # 결과 저장
-                self.save_processed_data(final_sequences, feature_names)
-                self.logger.info("Data processing completed successfully")
-            else:
-                self.logger.warning("No data was processed")
-                
-        except Exception as e:
-            self.logger.error(f"Error processing data: {str(e)}")
-            raise
+   def validate_features(self, features: dict) -> bool:
+       """특성 검증"""
+       required_fields = {
+           'imu': [
+               'linear_acceleration_x', 'linear_acceleration_y', 'linear_acceleration_z',
+               'angular_velocity_x', 'angular_velocity_y', 'angular_velocity_z'
+           ],
+           'path': ['position_x', 'position_y', 'position_z']
+       }
+       
+       for category, fields in required_fields.items():
+           if not all(field in features[category]['field'].values for field in fields):
+               self.logger.error(f"Missing required fields in {category} data")
+               return False
+       return True
 
-    def save_processed_data(self, sequences: np.ndarray, feature_names: List[str]) -> None:
-        """처리된 데이터 저장"""
-        try:
-            output_dir = Path(self.config['output']['directory'])
-            output_dir.mkdir(exist_ok=True)
-            
-            # 시퀀스 데이터 저장
-            np.save(output_dir / 'sequences.npy', sequences)
-            
-            # 특성 이름 저장
-            with open(output_dir / 'feature_names.json', 'w') as f:
-                json.dump(feature_names, f)
-            
-            # 스케일러 파라미터 저장
-            scaler_params = {
-                'data_min_': self.scaler.data_min_.tolist(),
-                'data_max_': self.scaler.data_max_.tolist()
-            }
-            with open(output_dir / 'scaler_params.json', 'w') as f:
-                json.dump(scaler_params, f)
-                
-            self.logger.info(f"Saved processed data to {output_dir}")
-            
-        except Exception as e:
-            self.logger.error(f"Error saving processed data: {str(e)}")
-            raise
+   def validate_data_quality(self, df: pd.DataFrame) -> bool:
+       """데이터 품질 검증"""
+       validations = {
+           'missing_values': df['value'].isnull().sum(),
+           'unique_simulations': df['simulation_id'].nunique(),
+           'timespan': df['timestamp'].max() - df['timestamp'].min(),
+           'feature_completeness': self.validate_features(self._extract_features(df))
+       }
+       self.logger.info(f"Data validation results: {validations}")
+       return validations['missing_values'] == 0 and validations['feature_completeness']
 
-    def cleanup(self) -> None:
-        """리소스 정리"""
-        try:
-            self.client.close()
-            self.logger.info("Cleaned up resources")
-        except Exception as e:
-            self.logger.error(f"Error during cleanup: {str(e)}")
+   def _extract_features(self, df: pd.DataFrame) -> dict:
+       """특성 추출"""
+       imu_fields = [
+           'linear_acceleration_x', 'linear_acceleration_y', 'linear_acceleration_z',
+           'angular_velocity_x', 'angular_velocity_y', 'angular_velocity_z'
+       ]
+       path_fields = ['position_x', 'position_y', 'position_z']
+       
+       return {
+           'imu': df[df['field'].isin(imu_fields)],
+           'path': df[df['field'].isin(path_fields)]
+       }
+
+   def create_feature_windows(self, df: pd.DataFrame, is_training: bool = True) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+       """특성 윈도우 생성"""
+       self.logger.info("Creating feature windows...")
+       windows = []
+       labels = []
+       
+       # 시뮬레이션 ID 셔플링
+       simulation_ids = df['simulation_id'].unique()
+       if is_training:
+           np.random.seed(42)
+           np.random.shuffle(simulation_ids)
+       
+       with ThreadPoolExecutor() as executor:
+           futures = []
+           for sim_id in simulation_ids:
+               sim_data = df[df['simulation_id'] == sim_id].sort_values('timestamp')
+               futures.append(executor.submit(
+                   self._process_simulation_data, sim_data, sim_id, is_training))
+           
+           for future in futures:
+               result = future.result()
+               if result:
+                   sim_windows, sim_labels = result
+                   windows.extend(sim_windows)
+                   if is_training:
+                       labels.extend(sim_labels)
+       
+       # 윈도우 레벨 셔플링
+       if is_training and windows:
+           indices = np.arange(len(windows))
+           np.random.shuffle(indices)
+           windows = np.array(windows)[indices]
+           labels = np.array(labels)[indices]
+           
+           # 학습 데이터 저장
+           np.save('X_train.npy', windows)
+           np.save('y_train.npy', labels)
+       
+       return np.array(windows), np.array(labels) if is_training else None
+
+   def _process_simulation_data(self, sim_data: pd.DataFrame, sim_id: str, is_training: bool):
+       """시뮬레이션 데이터 처리"""
+       try:
+           features = self._extract_features(sim_data)
+           if not self.validate_features(features):
+               return None
+           
+           imu_windows = self._create_windows(features['imu'], 'imu')
+           path_windows = self._create_windows(features['path'], 'path')
+           
+           if len(imu_windows) == 0 or len(path_windows) == 0:
+               return None
+           
+           combined_windows = np.concatenate([imu_windows, path_windows], axis=2)
+           
+           if is_training:
+               is_abnormal = self._is_abnormal_simulation(sim_id)
+               labels = [is_abnormal] * len(combined_windows)
+               return combined_windows, labels
+           
+           return combined_windows, None
+           
+       except Exception as e:
+           self.logger.error(f"Error processing simulation {sim_id}: {str(e)}", exc_info=True)
+           return None
+
+   def _create_windows(self, data: pd.DataFrame, scaler_type: str, overlap: float = 0.5) -> np.ndarray:
+       """데이터 윈도우 생성"""
+       if len(data) < self.window_size:
+           self.logger.warning("Data length less than window size")
+           return np.array([])
+       
+       values = data['value'].values.reshape(-1, 1)
+       scaled_values = self.apply_scaling(values, scaler_type)
+       
+       stride = int(self.window_size * (1 - overlap))
+       windows = []
+       
+       for i in range(0, len(scaled_values) - self.window_size + 1, stride):
+           window = scaled_values[i:i + self.window_size]
+           if len(window) == self.window_size:
+               windows.append(window)
+       
+       return np.array(windows)
+
+   def apply_scaling(self, data: np.ndarray, scaler_type: str) -> np.ndarray:
+       """스케일링 적용"""
+       scaler = self.imu_scaler if scaler_type == 'imu' else self.path_scaler
+       return scaler.fit_transform(data)
+
+   def _is_abnormal_simulation(self, simulation_id: str) -> bool:
+       """이상치 시뮬레이션 판별"""
+       sim_number = int(simulation_id.split('_')[-1])
+       return sim_number % 10 == 0
+
+   def prepare_for_prediction(self, data: pd.DataFrame) -> np.ndarray:
+       """LSTM 모델 입력용 데이터 준비"""
+       if not self.validate_data_quality(data):
+           raise ValueError("Invalid data quality")
+       
+       features = self._extract_features(data)
+       imu_data = self._create_windows(features['imu'], 'imu')
+       path_data = self._create_windows(features['path'], 'path')
+       
+       if len(imu_data) == 0 or len(path_data) == 0:
+           raise ValueError("Insufficient data for prediction")
+       
+       combined_data = np.concatenate([imu_data, path_data], axis=2)
+       return combined_data.reshape(-1, self.window_size, combined_data.shape[-1])
 
 if __name__ == "__main__":
-    filter = DroneDataFilter('filter_config.yaml')
-    
-    try:
-        # 최근 7일간의 데이터 처리
-        start_time = (datetime.now() - timedelta(days=7)).isoformat()
-        end_time = datetime.now().isoformat()
-        
-        filter.process_time_range(start_time, end_time)
-    except Exception as e:
-        logging.error(f"Failed to process data: {str(e)}")
-    finally:
-        filter.cleanup()
+   filter = DroneDataFilter()
+   try:
+       raw_data = filter.fetch_data(hours=24)
+       
+       if filter.validate_data_quality(raw_data):
+           X_train, y_train = filter.create_feature_windows(raw_data, is_training=True)
+           filter.save_scaler_params()
+           
+           filter.logger.info(f"Processed {len(X_train)} windows")
+           filter.logger.info(f"Abnormal ratio: {np.mean(y_train):.2%}")
+       else:
+           filter.logger.error("Data validation failed")
+           
+   except Exception as e:
+       filter.logger.error(f"Error in main execution: {str(e)}", exc_info=True)
