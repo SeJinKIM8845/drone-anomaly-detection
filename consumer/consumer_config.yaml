@@ -1,0 +1,39 @@
+# Kafka Configuration
+kafka:
+  bootstrap_servers:
+    - "kafka01:9093"
+    - "kafka02:9093"
+    - "kafka03:9093"
+  consumer:
+    group_id: "drone_data_group"
+    auto_offset_reset: "latest"
+    enable_auto_commit: True
+    # 추가할 설정
+    max_poll_records: 500      # 한 번에 가져올 최대 레코드 수
+    fetch_max_bytes: 52428800  # 50MB
+    max_partition_fetch_bytes: 1048576  # 1MB
+  topics:
+    - "drone_imu"
+    - "drone_battery"
+    - "drone_vfr"
+    - "drone_local_pose"
+    - "drone_global_position"
+    - "drone_velocity"
+    - "drone_state"
+
+# InfluxDB Configuration
+influxdb:
+  url: "http://localhost:8086"
+  token: ""
+  org: "drone_org"
+  bucket: "drone_data"
+  # 추가할 설정
+  buffer_size: 100            # 배치 처리를 위한 버퍼 크기
+  write_timeout: 10000        # 쓰기 타임아웃 (ms)
+  max_retries: 3              # 재시도 횟수
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(levelname)s - %(message)s"
+  dir: "logs"

@@ -1,0 +1,30 @@
+# Kafka Configuration
+kafka:
+  bootstrap_servers:
+    - "kafka01:9093"
+    - "kafka02:9093"
+    - "kafka03:9093"
+  producer:
+    acks: "all"
+    retries: 5
+    retry_backoff_ms: 1000
+    compression_type: "gzip"
+    # 추가할 설정
+    batch_size: 16384        # 배치 크기 최적화
+    linger_ms: 100          # 배치 전송 대기 시간
+    max_in_flight_requests_per_connection: 5  # 동시 요청 제한
+    request_timeout_ms: 30000  # 요청 타임아웃
+
+# ROS2 Configuration
+ros2:
+  qos:
+    reliability: "best_effort"
+    durability: "volatile"
+    history: "keep_last"
+    depth: 10
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(levelname)s - %(message)s"
+  dir: "logs"
