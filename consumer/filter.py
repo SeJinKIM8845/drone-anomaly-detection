@@ -1,542 +1,316 @@
+#!/usr/bin/env python3
 import os
+import pandas as pd
+import numpy as np
+from influxdb_client import InfluxDBClient
+from sklearn.preprocessing import MinMaxScaler
 import json
 import yaml
+from pathlib import Path
 import logging
-import numpy as np
-from datetime import datetime, timedelta
-from typing import Dict, List, Any, Union, Optional, Tuple
-from influxdb_client import InfluxDBClient
-from influxdb_client.client.write_api import SYNCHRONOUS
-import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-import warnings
-warnings.filterwarnings('ignore')
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Union
+from scipy import stats
 
 class DroneDataFilter:
-    def __init__(self, config: Dict):
-        """
-        Initialize DroneDataFilter with configuration and setup necessary components
-        """
-        self.config = config
-        self.setup_logging()
-        self.setup_influxdb_client()
+   def __init__(self, config_path: str = "filter_config.yaml"):
+       """Initialize DroneDataFilter with configuration"""
+       self.config = self._load_config(config_path)
+       self.setup_paths()
+       self.setup_logging()
+       self.client = self._setup_influxdb()
+       self.scalers = {}
+
+   def setup_paths(self):
+       """Setup necessary directories"""
+       for path_name, path in self.config['paths'].items():
+           path_obj = Path(path)
+           path_obj.mkdir(parents=True, exist_ok=True)
+           setattr(self, f"{path_name}_path", path_obj)
+
+   def setup_logging(self):
+       """Setup logging configuration"""
+       log_file = Path(self.config['paths']['base_dir']) / f'filter_{datetime.now():%Y%m%d_%H%M%S}.log'
+       logging.basicConfig(
+           level=logging.INFO,
+           format='%(asctime)s - %(levelname)s - %(message)s',
+           handlers=[
+               logging.StreamHandler(),
+               logging.FileHandler(log_file)
+           ]
+       )
+       self.logger = logging.getLogger(__name__)
+
+   def _load_config(self, config_path: str) -> dict:
+       """Load configuration from yaml file"""
+       try:
+           with open(config_path, 'r') as f:
+               return yaml.safe_load(f)
+       except Exception as e:
+           raise RuntimeError(f"Failed to load configuration: {e}")
+
+   def _setup_influxdb(self) -> InfluxDBClient:
+       """Setup InfluxDB client"""
+       return InfluxDBClient(
+           url=self.config['influxdb']['url'],
+           token=self.config['influxdb']['token'],
+           org=self.config['influxdb']['org']
+       )
+
+   def get_sensor_data(self, sensor_type: str, sensor_category: str) -> pd.DataFrame:
+        """Get data for specific sensor type"""
+        self.logger.info(f"Fetching data for {sensor_type} from category {sensor_category}")
         
-        # 스케일러 초기화
-        self.scaler_params = {}
-        self.scalers = {
-            'imu': MinMaxScaler(feature_range=(-1, 1)),
-            'path': MinMaxScaler(feature_range=(-1, 1))
-        }
+        query = f'''
+        from(bucket: "{self.config['influxdb']['bucket']}")
+            |> range(start: -30d)
+            |> filter(fn: (r) => r["_measurement"] == "drone_{sensor_type}")
+            |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+        '''
         
-        # IMU 데이터 필드 정의
-        self.imu_fields = [
-            'orientation_x', 'orientation_y', 'orientation_z', 'orientation_w',
-            'angular_velocity_x', 'angular_velocity_y', 'angular_velocity_z',
-            'linear_acceleration_x', 'linear_acceleration_y', 'linear_acceleration_z'
-        ]
-        
-        # 경로 데이터 필드 정의
-        self.path_fields = [
-            'position_x', 'position_y', 'position_z',
-            'orientation_x', 'orientation_y', 'orientation_z', 'orientation_w'
-        ]
-        
-        # 이상 상황 감지를 위한 임계값 설정
-        self.anomaly_thresholds = {
-            'angular_velocity': {
-                'max_change': 1.0,  # 초당 최대 변화율
-                'range': (-3.0, 3.0)  # 허용 범위
-            },
-            'linear_acceleration': {
-                'max_change': 2.0,
-                'range': (-10.0, 10.0)
-            },
-            'position': {
-                'max_deviation': 5.0  # 예상 경로로부터 최대 허용 편차
-            }
-        }
-
-        # 결측치 처리 설정
-        self.missing_value_config = {
-            'max_consecutive': 5,
-            'interpolation_method': 'linear',
-            'statistical_method': 'mean'
-        }
-
-    def setup_logging(self) -> None:
-        """
-        Configure logging settings
-        """
-        log_dir = self.config.get('logging', {}).get('dir', 'logs')
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-
-        log_file = os.path.join(
-            log_dir,
-            f'filter_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-        )
-
-        logging.basicConfig(
-            level=self.config.get('logging', {}).get('level', 'INFO'),
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-
-    def setup_influxdb_client(self) -> None:
-        """
-        Initialize InfluxDB client connection
-        """
         try:
-            self.influx_client = InfluxDBClient(
-                url=self.config['influxdb']['url'],
-                token=self.config['influxdb']['token'],
-                org=self.config['influxdb']['org']
-            )
-            self.query_api = self.influx_client.query_api()
-            self.logger.info("InfluxDB client initialized successfully")
-        except Exception as e:
-            self.logger.error(f"Failed to setup InfluxDB client: {e}")
-            raise
-    
-    def get_data_from_influxdb(self, start_time: str = "-30d") -> pd.DataFrame:
-        """
-        Retrieve and preprocess drone data from InfluxDB
-        """
-        try:
-            # IMU 데이터 쿼리
-            imu_query = f'''
-                from(bucket: "{self.config['influxdb']['bucket']}")
-                    |> range(start: {start_time})
-                    |> filter(fn: (r) => r["_measurement"] == "drone_imu")
-                    |> pivot(rowKey:["_time", "simulation_id"], 
-                            columnKey: ["_field"], 
-                            valueColumn: "_value")
-            '''
+            result = self.client.query_api().query_data_frame(query)
+            if isinstance(result, list):
+                result = pd.concat(result)
             
-            # 경로 데이터 쿼리
-            path_query = f'''
-                from(bucket: "{self.config['influxdb']['bucket']}")
-                    |> range(start: {start_time})
-                    |> filter(fn: (r) => r["_measurement"] == "drone_local_pose")
-                    |> pivot(rowKey:["_time", "simulation_id"], 
-                            columnKey: ["_field"], 
-                            valueColumn: "_value")
-            '''
-
-            # 쿼리 실행
-            imu_result = self.query_api.query_data_frame(imu_query)
-            path_result = self.query_api.query_data_frame(path_query)
-
-            # 필요한 컬럼만 선택
-            imu_df = imu_result[['_time', 'simulation_id', 
-                                'angular_velocity_x', 'angular_velocity_y', 'angular_velocity_z',
-                                'linear_acceleration_x', 'linear_acceleration_y', 'linear_acceleration_z',
-                                'orientation_w', 'orientation_x', 'orientation_y', 'orientation_z']]
-            
-            path_df = path_result[['_time', 'simulation_id',
-                                'position_x', 'position_y', 'position_z']]
-
-            # 컬럼명 변경
-            imu_df = imu_df.rename(columns={'_time': 'timestamp'})
-            path_df = path_df.rename(columns={'_time': 'timestamp'})
-
-            # 데이터 병합
-            merged_df = pd.merge_asof(
-                imu_df.sort_values('timestamp'),
-                path_df.sort_values('timestamp'),
-                on='timestamp',
-                by='simulation_id',
-                tolerance=pd.Timedelta('100ms')
-            )
-
-            # 데이터 타입 확인 로그
-            self.logger.info(f"Retrieved {len(merged_df)} records from InfluxDB")
-            self.logger.info(f"Data distribution across simulations: {merged_df['simulation_id'].value_counts().to_dict()}")
-            self.logger.info(f"Data types of columns:\n{merged_df.dtypes}")
-
-            return merged_df
-
+            if not result.empty:
+                features = self.config['sensors'][sensor_category][sensor_type]['features']
+                required_columns = ['_time', 'simulation_id'] + features
+                available_columns = [col for col in required_columns if col in result.columns]
+                result = result[available_columns]
+                
+                self.logger.info(f"Loaded {len(result)} rows for {sensor_type}")
+                self.logger.info(f"Available columns: {result.columns.tolist()}")
+                
+                if len(result) == 0:
+                    self.logger.warning(f"No data found for {sensor_type}")
+                
+                return result
+                
         except Exception as e:
-            self.logger.error(f"Error retrieving data from InfluxDB: {e}")
+            self.logger.error(f"Error fetching {sensor_type} data: {e}")
             raise
 
-    def filter_batch(self, start_time: str = "-30d") -> Tuple[pd.DataFrame, Dict]:
-       """
-       Process batch data for model training with comprehensive data filtering
-       """
-       try:
-           # 데이터 가져오기
-           data = self.get_data_from_influxdb(start_time)
-           self.logger.info("Starting batch filtering process")
-           
-           # 결측치 처리 (dropna 옵션 포함)
-           if self.config.get('missing_values', {}).get('use_dropna', False):
-               data = data.dropna()
-               self.logger.info(f"Dropped rows with missing values. Remaining rows: {len(data)}")
-           else:
-               data = self._handle_missing_values(data)
-           
-           # 급격한 변화 및 이상치 감지
-           data = self._detect_anomalies(data)
-           
-           # 이상치 제거
-           data = self._remove_outliers(data)
-           
-           # 데이터 정규화
-           normalized_data = self._normalize_data(data)
-           
-           # 시뮬레이션 ID 무작위화 및 데이터 셔플링
-           normalized_data = self._randomize_and_shuffle(normalized_data)
-           
-           # 정규화 파라미터 저장
-           self._save_normalization_params()
-           
-           self.logger.info("Batch filtering completed successfully")
-           return normalized_data, self.scaler_params
-           
-       except Exception as e:
-           self.logger.error(f"Error in batch filtering: {e}")
-           raise
-
-    def filter_inf(self, data: Dict) -> Dict:
-       """
-       Process real-time inference data with loaded normalization parameters
-       """
-       try:
-           # JSON 파라미터 로드 (없을 경우)
-           if not self.scaler_params:
-               self._load_normalization_params()
-           
-           # 데이터 검증
-           if not isinstance(data, dict):
-               raise ValueError("Input data must be dictionary")
-           
-           # 결측치 처리
-           processed_data = self._handle_missing_values_realtime(data)
-           
-           # 급격한 변화 감지
-           processed_data = self._check_rapid_changes(processed_data)
-           
-           # 정규화 적용
-           normalized_data = self._normalize_realtime(processed_data)
-           
-           return normalized_data
-           
-       except Exception as e:
-           self.logger.error(f"Error in inference filtering: {e}")
-           raise
-
-    def _detect_anomalies(self, data: pd.DataFrame) -> pd.DataFrame:
-       """
-       Detect anomalies in batch data including rapid changes and path deviations
-       """
-       data = data.copy()
-       data['is_anomaly'] = False
+   def get_all_sensor_data(self) -> Dict[str, pd.DataFrame]:
+       """Get data for all sensors"""
+       all_data = {}
        
-       # IMU 급격한 변화 감지
-       for field in ['angular_velocity', 'linear_acceleration']:
-           for axis in ['x', 'y', 'z']:
-               col = f"{field}_{axis}"
-               if col in data.columns:
-                   # 변화율 계산
-                   change_rate = data[col].diff().abs()
-                   threshold = self.anomaly_thresholds[field]['max_change']
-                   data.loc[change_rate > threshold, 'is_anomaly'] = True
-       
-       # 경로 이탈 감지
-       if all(f'position_{axis}' in data.columns for axis in ['x', 'y', 'z']):
-           # 이동 평균을 이용한 예상 경로 계산
-           window_size = 50
-           expected_position = data[['position_x', 'position_y', 'position_z']].rolling(window=window_size).mean()
-           
-           # 실제 위치와 예상 경로의 차이 계산
-           deviation = np.sqrt(
-               (data['position_x'] - expected_position['position_x'])**2 +
-               (data['position_y'] - expected_position['position_y'])**2 +
-               (data['position_z'] - expected_position['position_z'])**2
-           )
-           
-           # 임계값을 초과하는 편차를 이상으로 표시
-           data.loc[deviation > self.anomaly_thresholds['position']['max_deviation'], 'is_anomaly'] = True
-       
-       self.logger.info(f"Detected {data['is_anomaly'].sum()} anomalous points")
-       return data
-
-    def _handle_missing_values(self, data: pd.DataFrame) -> pd.DataFrame:
-       """
-       Handle missing values with configurable methods
-       """
-       for column in data.columns:
-           if column in ['timestamp', 'simulation_id', 'is_anomaly']:
-               continue
+       # Primary sensors
+       for sensor_type in self.config['sensors']['primary'].keys():
+           data = self.get_sensor_data(sensor_type, 'primary')
+           if not data.empty:
+               all_data[sensor_type] = data
                
-           # 연속된 결측치 개수 확인
-           null_groups = data[column].isnull().astype(int).groupby(
-               data[column].notnull().astype(int).cumsum()
-           ).sum()
-           
-           if null_groups.max() < self.missing_value_config['max_consecutive']:
-               # 선형 보간
-               data[column] = data[column].interpolate(
-                   method=self.missing_value_config['interpolation_method']
+       # Secondary sensors
+       for sensor_type in self.config['sensors']['secondary'].keys():
+           data = self.get_sensor_data(sensor_type, 'secondary')
+           if not data.empty:
+               all_data[sensor_type] = data
+               
+       return all_data
+
+   def filter_batch(self, data: Dict[str, pd.DataFrame]) -> Tuple[np.ndarray, Dict]:
+       """Process data for training"""
+       self.logger.info("Starting batch data processing")
+       
+       # 1. 결측치 처리
+       clean_data = self._handle_missing_values(data)
+       
+       # 2. 데이터 정규화
+       normalized_data, scaler_params = self._normalize_data(clean_data)
+       
+       # 3. 시퀀스 생성
+       sequences = self._create_sequences(normalized_data)
+       
+       # 4. 데이터 셔플링
+       shuffled_sequences = self._shuffle_data(sequences)
+       
+       # 5. 저장
+       self._save_processed_data(shuffled_sequences, 'batch')
+       self._save_scaler_params(scaler_params)
+       
+       return shuffled_sequences, scaler_params
+
+   def filter_inf(self, data: Dict[str, pd.DataFrame], scaler_params: Dict) -> np.ndarray:
+       """Process data for inference"""
+       self.logger.info("Starting inference data processing")
+       
+       # 1. 결측치 처리
+       clean_data = self._handle_missing_values(data)
+       
+       # 2. 저장된 파라미터로 정규화
+       normalized_data = self._apply_normalization(clean_data, scaler_params)
+       
+       # 3. 시퀀스 생성
+       sequences = self._create_sequences(normalized_data)
+       
+       return sequences
+
+   def _handle_missing_values(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+       """Handle missing values in data"""
+       clean_data = {}
+       max_gap = self.config['preprocessing']['missing_values']['max_gap']
+       
+       for sensor_type, df in data.items():
+           if sensor_type in self.config['sensors']['primary']:
+               # 주요 센서는 선형 보간
+               df_clean = df.interpolate(
+                   method=self.config['preprocessing']['missing_values']['primary_method'],
+                   limit=max_gap
                )
            else:
-               # 통계적 대체
-               if self.missing_value_config['statistical_method'] == 'mean':
-                   fill_value = data[column].mean()
-               elif self.missing_value_config['statistical_method'] == 'median':
-                   fill_value = data[column].median()
-               else:
-                   fill_value = data[column].mode()[0]
-               data[column] = data[column].fillna(fill_value)
-       
-       return data
-
-    def _remove_outliers(self, data: pd.DataFrame) -> pd.DataFrame:
-       """
-       Remove outliers using IQR method with adjusted thresholds
-       """
-       for column in data.columns:
-           if column in ['timestamp', 'simulation_id', 'is_anomaly']:
-               continue
-               
-           Q1 = data[column].quantile(0.25)
-           Q3 = data[column].quantile(0.75)
-           IQR = Q3 - Q1
-           lower_bound = Q1 - 1.5 * IQR
-           upper_bound = Q3 + 1.5 * IQR
+               # 보조 센서는 전방 채우기
+               df_clean = df.fillna(
+                   method=self.config['preprocessing']['missing_values']['secondary_method'],
+                   limit=max_gap
+               )
            
-           data[column] = data[column].clip(lower=lower_bound, upper=upper_bound)
+           # 남은 결측치는 0으로 채우기
+           df_clean = df_clean.fillna(0)
+           clean_data[sensor_type] = df_clean
        
-       return data
+       return clean_data
 
-    def _normalize_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Normalize data and store parameters for inference
-        """
-        norm_data = data.copy()
+   def _normalize_data(self, data: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict]:
+    """Normalize data and store scaling parameters"""
+    normalized_data = {}
+    scaler_params = {}
+    
+    # feature_range를 tuple로 변환
+    feature_range = tuple(self.config['preprocessing']['normalization']['feature_range'])
+    
+    for sensor_type, df in data.items():
+        features = self.config['sensors']['primary'].get(sensor_type, {}).get('features', []) or \
+                  self.config['sensors']['secondary'].get(sensor_type, {}).get('features', [])
         
-        # 데이터 타입 변환
-        numeric_columns = data.select_dtypes(include=['object']).columns
-        for col in numeric_columns:
-            if col not in ['timestamp', 'simulation_id']:
-                norm_data[col] = pd.to_numeric(norm_data[col], errors='coerce')
-
-        # IMU 데이터 정규화
-        imu_columns = [col for col in norm_data.columns if any(field in col for field in self.imu_fields)]
-        if imu_columns:
-            # 숫자형 데이터만 선택
-            imu_data = norm_data[imu_columns].select_dtypes(include=[np.number])
-            norm_data[imu_data.columns] = self.scalers['imu'].fit_transform(imu_data)
-            self.scaler_params['imu'] = {
-                'min': self.scalers['imu'].data_min_.tolist(),
-                'max': self.scalers['imu'].data_max_.tolist(),
-                'columns': imu_data.columns.tolist()
+        if features:
+            scaler = MinMaxScaler(feature_range=feature_range)  # tuple로 전달
+            normalized_values = scaler.fit_transform(df[features])
+            normalized_df = pd.DataFrame(
+                normalized_values,
+                columns=features,
+                index=df.index
+            )
+            
+            normalized_data[sensor_type] = normalized_df
+            scaler_params[sensor_type] = {
+                'min': scaler.data_min_.tolist(),
+                'max': scaler.data_max_.tolist(),
+                'feature_names': features
             }
+    
+    return normalized_data, scaler_params
+
+   def _create_sequences(self, data: Dict[str, pd.DataFrame]) -> np.ndarray:
+        """Create sequences for LSTM"""
+        sequence_length = self.config['preprocessing']['sequence_length']
+        stride = self.config['preprocessing']['stride']
         
-        # 경로 데이터 정규화
-        path_columns = [col for col in norm_data.columns if any(field in col for field in self.path_fields)]
-        if path_columns:
-            # 숫자형 데이터만 선택
-            path_data = norm_data[path_columns].select_dtypes(include=[np.number])
-            norm_data[path_data.columns] = self.scalers['path'].fit_transform(path_data)
-            self.scaler_params['path'] = {
-                'min': self.scalers['path'].data_min_.tolist(),
-                'max': self.scalers['path'].data_max_.tolist(),
-                'columns': path_data.columns.tolist()
-            }
+        # 모든 특성 결합
+        all_features = []
+        for sensor_type in self.config['lstm_data']['feature_order']:
+            if sensor_type in data:
+                self.logger.info(f"Adding features from {sensor_type}: {data[sensor_type].shape}")
+                all_features.append(data[sensor_type])
         
-        return norm_data
+        if not all_features:
+            raise ValueError("No features available for sequence creation")
+        
+        combined_data = pd.concat(all_features, axis=1)
+        self.logger.info(f"Combined data shape: {combined_data.shape}")
+        
+        # 시퀀스 생성
+        sequences = []
+        for i in range(0, len(combined_data) - sequence_length, stride):
+            sequence = combined_data.iloc[i:i + sequence_length].values
+            sequences.append(sequence)
+            
+        sequences = np.array(sequences)
+        self.logger.info(f"Created sequences shape: {sequences.shape}")
+        
+        return sequences
 
-    def _randomize_and_shuffle(self, data: pd.DataFrame) -> pd.DataFrame:
-       """
-       Randomize simulation IDs and shuffle data while maintaining sequence integrity
-       """
-       # 시뮬레이션 ID 무작위화
-       if 'simulation_id' in data.columns:
-           unique_ids = data['simulation_id'].unique()
-           id_mapping = {old_id: f"sim_{i:03d}" for i, old_id in enumerate(unique_ids)}
-           data['simulation_id'] = data['simulation_id'].map(id_mapping)
+   def _shuffle_data(self, sequences: np.ndarray) -> np.ndarray:
+       """Shuffle sequences randomly"""
+       indices = np.arange(sequences.shape[0])
+       np.random.shuffle(indices)
+       shuffled_sequences = sequences[indices]
        
-       # 시뮬레이션별로 데이터 셔플링
-       shuffled_data = pd.DataFrame()
-       simulation_groups = data.groupby('simulation_id')
-       simulation_ids = list(simulation_groups.groups.keys())
-       np.random.shuffle(simulation_ids)
+       self.logger.info(f"Data shuffled: {sequences.shape[0]} sequences")
        
-       for sim_id in simulation_ids:
-           sim_data = simulation_groups.get_group(sim_id)
-           shuffled_data = pd.concat([shuffled_data, sim_data])
-       
-       return shuffled_data.reset_index(drop=True)
+       return shuffled_sequences
 
-    def _save_normalization_params(self) -> None:
-       """
-       Save normalization parameters to JSON file
-       """
-       save_dir = os.path.join(self.config.get('save_dir', 'saved_models'))
-       os.makedirs(save_dir, exist_ok=True)
+   def _save_processed_data(self, sequences: np.ndarray, mode: str):
+       """Save processed data"""
+       save_path = Path(self.config['paths']['base_dir'])
        
-       save_path = os.path.join(save_dir, 'normalization_params.json')
-       with open(save_path, 'w') as f:
-           json.dump(self.scaler_params, f, indent=4)
+       # numpy 형식으로 저장
+       np.save(save_path / f'{mode}_sequences.npy', sequences)
        
-       self.logger.info(f"Saved normalization parameters to {save_path}")
-
-    def _load_normalization_params(self) -> None:
-       """
-       Load normalization parameters from JSON file
-       """
-       load_path = os.path.join(
-           self.config.get('save_dir', 'saved_models'),
-           'normalization_params.json'
+       # CSV 형식으로 저장 (LSTM용)
+       reshaped_data = sequences.reshape(-1, sequences.shape[-1])
+       feature_names = self._get_feature_names()
+       
+       pd.DataFrame(reshaped_data, columns=feature_names).to_csv(
+           save_path / f'{mode}_data.csv',
+           index=False
        )
+
+   def _save_scaler_params(self, scaler_params: Dict):
+       """Save scaling parameters"""
+       save_path = Path(self.config['paths']['base_dir']) / self.config['paths']['scaler_params']
+       with open(save_path, 'w') as f:
+           json.dump(scaler_params, f, indent=2)
+
+   def _get_feature_names(self) -> List[str]:
+       """Get list of all feature names"""
+       feature_names = []
+       for sensor_type in self.config['lstm_data']['feature_order']:
+           if sensor_type.endswith('_features'):
+               sensor_type = sensor_type[:-9]  # Remove '_features' suffix
+           if sensor_type in self.config['sensors']['primary']:
+               feature_names.extend(self.config['sensors']['primary'][sensor_type]['features'])
+           elif sensor_type in self.config['sensors']['secondary']:
+               feature_names.extend(self.config['sensors']['secondary'][sensor_type]['features'])
+       return feature_names
+
+   def _apply_normalization(self, data: Dict[str, pd.DataFrame], scaler_params: Dict) -> Dict[str, pd.DataFrame]:
+       """Apply saved normalization parameters to new data"""
+       normalized_data = {}
        
-       try:
-           with open(load_path, 'r') as f:
-               self.scaler_params = json.load(f)
-           self.logger.info(f"Loaded normalization parameters from {load_path}")
-       except FileNotFoundError:
-           self.logger.error(f"Normalization parameters file not found at {load_path}")
-           raise
-
-    def _handle_missing_values_realtime(self, data: Dict) -> Dict:
-       """
-       Handle missing values in real-time data
-       """
-       for key in data:
-           if data[key] is None:
-               if key.startswith('angular_velocity'):
-                   data[key] = 0.0
-               elif key.startswith('linear_acceleration'):
-                   data[key] = 9.81 if key.endswith('z') else 0.0
-               elif key.startswith('orientation'):
-                   data[key] = 0.0
-               elif key.startswith('position'):
-                   data[key] = 0.0
-       return data
-
-    def _check_rapid_changes(self, data: Dict) -> Dict:
-       """
-       Check for rapid changes in real-time data
-       """
-       if hasattr(self, 'previous_data'):
-           for key, value in data.items():
-               if key in self.previous_data:
-                   change = abs(value - self.previous_data[key])
-                   
-                   if key.startswith('angular_velocity'):
-                       threshold = self.anomaly_thresholds['angular_velocity']['max_change']
-                       if change > threshold:
-                           self.logger.warning(f"Rapid change detected in {key}: {change}")
-                           
-                   elif key.startswith('linear_acceleration'):
-                       threshold = self.anomaly_thresholds['linear_acceleration']['max_change']
-                       if change > threshold:
-                           self.logger.warning(f"Rapid change detected in {key}: {change}")
+       for sensor_type, df in data.items():
+           if sensor_type in scaler_params:
+               params = scaler_params[sensor_type]
+               features = params['feature_names']
+               
+               # 스케일러 재생성
+               scaler = MinMaxScaler()
+               scaler.min_ = np.array(params['min'])
+               scaler.scale_ = (np.array(params['max']) - scaler.min_)
+               
+               # 정규화 적용
+               normalized_values = scaler.transform(df[features])
+               normalized_df = pd.DataFrame(
+                   normalized_values,
+                   columns=features,
+                   index=df.index
+               )
+               
+               normalized_data[sensor_type] = normalized_df
        
-       self.previous_data = data.copy()
-       return data
+       return normalized_data
 
-    def _normalize_realtime(self, data: Dict) -> Dict:
-        """
-        Apply normalization to real-time data using stored parameters
-        """
-        try:
-            normalized_data = {}
-            for key, value in data.items():
-                if key in self.scaler_params.get('imu', {}).get('columns', []):
-                    idx = self.scaler_params['imu']['columns'].index(key)
-                    min_val = self.scaler_params['imu']['min'][idx]
-                    max_val = self.scaler_params['imu']['max'][idx]
-                    
-                    # IMU 데이터 정규화
-                    normalized_data[key] = (value - min_val) / (max_val - min_val) if max_val != min_val else 0
-                    
-                elif key in self.scaler_params.get('path', {}).get('columns', []):
-                    idx = self.scaler_params['path']['columns'].index(key)
-                    min_val = self.scaler_params['path']['min'][idx]
-                    max_val = self.scaler_params['path']['max'][idx]
-                    
-                    # 경로 데이터 정규화
-                    normalized_data[key] = (value - min_val) / (max_val - min_val) if max_val != min_val else 0
-                    
-                else:
-                    self.logger.warning(f"Key {key} not found in scaler parameters")
-                    continue
-            
-            return normalized_data
-            
-        except Exception as e:
-            self.logger.error(f"Error in realtime normalization: {e}")
-            self.logger.error(f"Error details - Key: {key}, Value: {value}")
-            raise
-
-    def cleanup(self):
-       """
-       Cleanup resources and connections
-       """
-       try:
-           if hasattr(self, 'influx_client'):
-               self.influx_client.close()
-           self.logger.info("Resources cleaned up successfully")
-       except Exception as e:
-           self.logger.error(f"Error during cleanup: {e}")
-
-    def verify_data_quality(self, data: pd.DataFrame) -> bool:
-       """
-       Verify the quality of processed data
-       """
-       try:
-           # 데이터 크기 검증
-           if len(data) < 1000:  # 최소 데이터 수 확인
-               self.logger.warning(f"Insufficient data points: {len(data)}")
-               return False
-               
-           # 결측치 비율 검증
-           missing_ratio = data.isnull().sum() / len(data)
-           if any(missing_ratio > 0.1):  # 10% 이상 결측치가 있는 컬럼 확인
-               self.logger.warning(f"High missing value ratio: {missing_ratio[missing_ratio > 0.1]}")
-               return False
-               
-           # 이상치 비율 검증
-           if 'is_anomaly' in data.columns:
-               anomaly_ratio = data['is_anomaly'].mean()
-               if anomaly_ratio > 0.2:  # 20% 이상 이상치 확인
-                   self.logger.warning(f"High anomaly ratio: {anomaly_ratio:.2%}")
-                   return False
-           
-           return True
-           
-       except Exception as e:
-           self.logger.error(f"Error in data quality verification: {e}")
-           return False
+   def cleanup(self):
+       """Cleanup resources"""
+       if hasattr(self, 'client'):
+           self.client.close()
+       self.logger.info("Resources cleaned up")
 
 if __name__ == "__main__":
-   # 설정 파일 로드
    try:
-       with open('config/filter_config.yaml', 'r') as f:
-           config = yaml.safe_load(f)
-   except Exception as e:
-       logging.error(f"Failed to load configuration: {e}")
-       raise
-
-   # DroneDataFilter 인스턴스 생성 및 실행
-   try:
-       filter = DroneDataFilter(config)
-       processed_data, scaler_params = filter.filter_batch()
-       
-       if filter.verify_data_quality(processed_data):
-           logging.info("Data processing completed successfully")
-       else:
-           logging.warning("Data quality verification failed")
-           
-   except Exception as e:
-       logging.error(f"Error in main execution: {e}")
-       raise
-   finally:
+       filter = DroneDataFilter()
+       data = filter.get_all_sensor_data()
+       sequences, scaler_params = filter.filter_batch(data)
        filter.cleanup()
+   except Exception as e:
+       logging.error(f"Error in main execution: {e}", exc_info=True)
