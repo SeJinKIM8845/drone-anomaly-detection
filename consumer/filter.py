@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-import os
 import pandas as pd
 import numpy as np
 from influxdb_client import InfluxDBClient
@@ -9,308 +7,337 @@ import yaml
 from pathlib import Path
 import logging
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Union
-from scipy import stats
+from typing import Dict, List, Tuple
+import sys
 
 class DroneDataFilter:
-   def __init__(self, config_path: str = "filter_config.yaml"):
-       """Initialize DroneDataFilter with configuration"""
-       self.config = self._load_config(config_path)
-       self.setup_paths()
-       self.setup_logging()
-       self.client = self._setup_influxdb()
-       self.scalers = {}
+    def __init__(self, config_path: str = "filter_config.yaml"):
+        self.config = self._load_config(config_path)
+        self.setup_paths()
+        self.setup_logging()
+        self.client = self._setup_influxdb()
+        self.validate_config()
 
-   def setup_paths(self):
-       """Setup necessary directories"""
-       for path_name, path in self.config['paths'].items():
-           path_obj = Path(path)
-           path_obj.mkdir(parents=True, exist_ok=True)
-           setattr(self, f"{path_name}_path", path_obj)
+    def validate_config(self) -> None:
+        """설정 파일 유효성 검사"""
+        required_sections = ['filter', 'fields', 'influxdb', 'save', 'logging', 'performance']
+        for section in required_sections:
+            if section not in self.config:
+                raise ValueError(f"Missing required section '{section}' in config")
+        if len(self.config['fields']) == 0:
+            raise ValueError("No sensor fields defined in config")
+        self.logger.info("Config validation successful")
 
-   def setup_logging(self):
-       """Setup logging configuration"""
-       log_file = Path(self.config['paths']['base_dir']) / f'filter_{datetime.now():%Y%m%d_%H%M%S}.log'
-       logging.basicConfig(
-           level=logging.INFO,
-           format='%(asctime)s - %(levelname)s - %(message)s',
-           handlers=[
-               logging.StreamHandler(),
-               logging.FileHandler(log_file)
-           ]
-       )
-       self.logger = logging.getLogger(__name__)
+    def setup_paths(self) -> None:
+        """저장 경로 설정"""
+        for path_name, path in self.config['save'].items():
+            path_obj = Path(path)
+            path_obj.mkdir(parents=True, exist_ok=True)
+            setattr(self, f"{path_name}_path", path_obj)
 
-   def _load_config(self, config_path: str) -> dict:
-       """Load configuration from yaml file"""
-       try:
-           with open(config_path, 'r') as f:
-               return yaml.safe_load(f)
-       except Exception as e:
-           raise RuntimeError(f"Failed to load configuration: {e}")
+    def setup_logging(self) -> None:
+        """로깅 설정"""
+        log_file = Path(self.config['save']['log_dir']) / self.config['logging']['file_name']
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers = [
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file)
+        ]
+        logging.basicConfig(
+            level=getattr(logging, self.config['logging']['level']),
+            format=self.config['logging']['format'],
+            handlers=handlers
+        )
+        self.logger = logging.getLogger(__name__)
 
-   def _setup_influxdb(self) -> InfluxDBClient:
-       """Setup InfluxDB client"""
-       return InfluxDBClient(
-           url=self.config['influxdb']['url'],
-           token=self.config['influxdb']['token'],
-           org=self.config['influxdb']['org']
-       )
+    def _load_config(self, config_path: str) -> dict:
+        """설정 파일 로드"""
+        try:
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            raise ValueError(f"Failed to load config file: {e}")
 
-   def get_sensor_data(self, sensor_type: str, sensor_category: str) -> pd.DataFrame:
-        """Get data for specific sensor type"""
-        self.logger.info(f"Fetching data for {sensor_type} from category {sensor_category}")
-        
+    def _setup_influxdb(self) -> InfluxDBClient:
+        """InfluxDB 클라이언트 설정"""
+        return InfluxDBClient(
+            url=self.config['influxdb']['url'],
+            token=self.config['influxdb']['token'],
+            org=self.config['influxdb']['org']
+        )
+
+    def validate_data(self, df: pd.DataFrame, sensor_type: str) -> None:
+        if df.empty:
+            raise ValueError(f"Empty dataframe for sensor type: {sensor_type}")
+        required_features = self.config['fields'][sensor_type]
+        missing_features = [f for f in required_features if f not in df.columns]
+        if missing_features:
+            raise ValueError(f"Missing features for {sensor_type}: {missing_features}")
+        self.logger.info(f"Data validation successful for {sensor_type}")
+        self.logger.info(f"Shape: {df.shape}, Features: {df.columns.tolist()}")
+
+    def validate_shapes(self, data: Dict[str, pd.DataFrame], sequences: np.ndarray, sim_ids: np.ndarray) -> None:
+        first_sensor = next(iter(data.keys()))
+        df_first = data[first_sensor].sort_values('_time')
+        sequence_length = self.config['filter']['data_processing']['sequence_length']
+        stride = self.config['filter']['data_processing']['stride']
+        expected_count = 0
+        for sim_id, group in df_first.groupby('simulation_id'):
+            count = (len(group) - sequence_length) // stride + 1 if len(group) >= sequence_length else 0
+            expected_count += count
+        actual_count = len(sequences)
+        self.logger.info(f"Expected sequences: {expected_count}, Generated sequences: {actual_count}")
+        expected_features = sum(len(features) for features in self.config['fields'].values())
+        if sequences.shape[2] != expected_features:
+            raise ValueError(f"Feature count mismatch. Expected: {expected_features}, Got: {sequences.shape[2]}")
+
+    def get_sensor_data(self, sensor_type: str) -> pd.DataFrame:
         query = f'''
         from(bucket: "{self.config['influxdb']['bucket']}")
-            |> range(start: -30d)
-            |> filter(fn: (r) => r["_measurement"] == "drone_{sensor_type}")
-            |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+        |> range(start: -30d)
+        |> filter(fn: (r) => r["_measurement"] == "drone_{sensor_type}")
+        |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
         '''
-        
-        try:
-            result = self.client.query_api().query_data_frame(query)
-            if isinstance(result, list):
-                result = pd.concat(result)
-            
-            if not result.empty:
-                features = self.config['sensors'][sensor_category][sensor_type]['features']
-                required_columns = ['_time', 'simulation_id'] + features
-                available_columns = [col for col in required_columns if col in result.columns]
-                result = result[available_columns]
-                
-                self.logger.info(f"Loaded {len(result)} rows for {sensor_type}")
-                self.logger.info(f"Available columns: {result.columns.tolist()}")
-                
-                if len(result) == 0:
-                    self.logger.warning(f"No data found for {sensor_type}")
-                
-                return result
-                
-        except Exception as e:
-            self.logger.error(f"Error fetching {sensor_type} data: {e}")
-            raise
+        result = self.client.query_api().query_data_frame(query)
+        if isinstance(result, list):
+            result = pd.concat(result)
+        self.logger.info(f"Retrieved columns for {sensor_type}: {result.columns.tolist()}")
+        if 'simulation_id' not in result.columns:
+            self.logger.warning(f"simulation_id column missing for {sensor_type}, defaulting to 0")
+            result['simulation_id'] = 0
+        if result.empty:
+            self.logger.warning(f"No data found for sensor type: {sensor_type}")
+            return result
+        features = self.config['fields'][sensor_type]
+        required_columns = ['_time', 'simulation_id'] + features
+        missing = [col for col in required_columns if col not in result.columns]
+        if missing:
+            raise KeyError(f"Missing columns for {sensor_type}: {missing}")
+        result = result[required_columns].sort_values('_time')
+        self.validate_data(result, sensor_type)
+        return result
 
-   def get_all_sensor_data(self) -> Dict[str, pd.DataFrame]:
-       """Get data for all sensors"""
-       all_data = {}
-       
-       # Primary sensors
-       for sensor_type in self.config['sensors']['primary'].keys():
-           data = self.get_sensor_data(sensor_type, 'primary')
-           if not data.empty:
-               all_data[sensor_type] = data
-               
-       # Secondary sensors
-       for sensor_type in self.config['sensors']['secondary'].keys():
-           data = self.get_sensor_data(sensor_type, 'secondary')
-           if not data.empty:
-               all_data[sensor_type] = data
-               
-       return all_data
+    def get_all_sensor_data(self) -> Dict[str, pd.DataFrame]:
+        """모든 센서 데이터 조회"""
+        return {sensor_type: self.get_sensor_data(sensor_type)
+                for sensor_type in self.config['fields']}
 
-   def filter_batch(self, data: Dict[str, pd.DataFrame]) -> Tuple[np.ndarray, Dict]:
-       """Process data for training"""
-       self.logger.info("Starting batch data processing")
-       
-       # 1. 결측치 처리
-       clean_data = self._handle_missing_values(data)
-       
-       # 2. 데이터 정규화
-       normalized_data, scaler_params = self._normalize_data(clean_data)
-       
-       # 3. 시퀀스 생성
-       sequences = self._create_sequences(normalized_data)
-       
-       # 4. 데이터 셔플링
-       shuffled_sequences = self._shuffle_data(sequences)
-       
-       # 5. 저장
-       self._save_processed_data(shuffled_sequences, 'batch')
-       self._save_scaler_params(scaler_params)
-       
-       return shuffled_sequences, scaler_params
+    def filter_batch(self, data: Dict[str, pd.DataFrame]) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        self.logger.info("Starting batch filtering process")
+        clean_data = self._handle_missing_values(data)
+        sync_data = self._synchronize_data(clean_data)
+        normalized_data, scaler_params = self._normalize_data(sync_data)
+        sequences, sim_ids = self._create_sequences(normalized_data)
+        sequences, sim_ids = self._shuffle_data(sequences, sim_ids)
+        self.validate_shapes(sync_data, sequences, sim_ids)
+        self._save_processed_data(sequences, 'batch')
+        self._save_scaler_params(scaler_params)
+        self.logger.info("Batch filtering completed")
+        return sequences, sim_ids, scaler_params
 
-   def filter_inf(self, data: Dict[str, pd.DataFrame], scaler_params: Dict) -> np.ndarray:
-       """Process data for inference"""
-       self.logger.info("Starting inference data processing")
-       
-       # 1. 결측치 처리
-       clean_data = self._handle_missing_values(data)
-       
-       # 2. 저장된 파라미터로 정규화
-       normalized_data = self._apply_normalization(clean_data, scaler_params)
-       
-       # 3. 시퀀스 생성
-       sequences = self._create_sequences(normalized_data)
-       
-       return sequences
+    def filter_inf(self, data: Dict[str, pd.DataFrame], scaler_params: Dict) -> Tuple[np.ndarray, np.ndarray]:
+        clean_data = self._handle_missing_values(data)
+        sync_data = self._synchronize_data(clean_data)
+        normalized_data = self._apply_normalization(sync_data, scaler_params)
+        sequences, sim_ids = self._create_sequences(normalized_data)
+        self.validate_shapes(sync_data, sequences, sim_ids)
+        return sequences, sim_ids
 
-   def _handle_missing_values(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-       """Handle missing values in data"""
-       clean_data = {}
-       max_gap = self.config['preprocessing']['missing_values']['max_gap']
-       
-       for sensor_type, df in data.items():
-           if sensor_type in self.config['sensors']['primary']:
-               # 주요 센서는 선형 보간
-               df_clean = df.interpolate(
-                   method=self.config['preprocessing']['missing_values']['primary_method'],
-                   limit=max_gap
-               )
-           else:
-               # 보조 센서는 전방 채우기
-               df_clean = df.fillna(
-                   method=self.config['preprocessing']['missing_values']['secondary_method'],
-                   limit=max_gap
-               )
-           
-           # 남은 결측치는 0으로 채우기
-           df_clean = df_clean.fillna(0)
-           clean_data[sensor_type] = df_clean
-       
-       return clean_data
-
-   def _normalize_data(self, data: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict]:
-    """Normalize data and store scaling parameters"""
-    normalized_data = {}
-    scaler_params = {}
-    
-    # feature_range를 tuple로 변환
-    feature_range = tuple(self.config['preprocessing']['normalization']['feature_range'])
-    
-    for sensor_type, df in data.items():
-        features = self.config['sensors']['primary'].get(sensor_type, {}).get('features', []) or \
-                  self.config['sensors']['secondary'].get(sensor_type, {}).get('features', [])
-        
-        if features:
-            scaler = MinMaxScaler(feature_range=feature_range)  # tuple로 전달
-            normalized_values = scaler.fit_transform(df[features])
-            normalized_df = pd.DataFrame(
-                normalized_values,
-                columns=features,
-                index=df.index
+    def _handle_missing_values(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        clean_data = {}
+        max_gap = self.config['filter']['missing_values']['max_consecutive_missing']
+        for sensor_type, df in data.items():
+            self.logger.info(f"Handling missing values for {sensor_type}")
+            initial_missing = df.isnull().sum().sum()
+            df_clean = df.copy().interpolate(
+                method=self.config['filter']['missing_values']['interpolation_method'],
+                limit=max_gap
             )
-            
-            normalized_data[sensor_type] = normalized_df
-            scaler_params[sensor_type] = {
-                'min': scaler.data_min_.tolist(),
-                'max': scaler.data_max_.tolist(),
-                'feature_names': features
-            }
-    
-    return normalized_data, scaler_params
+            remaining_missing = df_clean.isnull().sum().sum()
+            if remaining_missing > 0:
+                self.logger.warning(f"Filling remaining {remaining_missing} missing values with mean for {sensor_type}")
+                df_clean = df_clean.fillna(df_clean.mean())
+            clean_data[sensor_type] = df_clean
+            self.logger.info(f"Handled {initial_missing - remaining_missing} missing values for {sensor_type}")
+        return clean_data
 
-   def _create_sequences(self, data: Dict[str, pd.DataFrame]) -> np.ndarray:
-        """Create sequences for LSTM"""
-        sequence_length = self.config['preprocessing']['sequence_length']
-        stride = self.config['preprocessing']['stride']
-        
-        # 모든 특성 결합
-        all_features = []
-        for sensor_type in self.config['lstm_data']['feature_order']:
-            if sensor_type in data:
-                self.logger.info(f"Adding features from {sensor_type}: {data[sensor_type].shape}")
-                all_features.append(data[sensor_type])
-        
-        if not all_features:
-            raise ValueError("No features available for sequence creation")
-        
-        combined_data = pd.concat(all_features, axis=1)
+    def _synchronize_data(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        sync_data = {}
+        # 1. imu 데이터를 기준으로 공통 인덱스 생성 (원래 imu 인덱스 사용)
+        imu_df = data.get('imu')
+        if imu_df is None or imu_df.empty:
+            raise ValueError("imu data is missing or empty. Cannot determine common time index.")
+        imu_df['_time'] = pd.to_datetime(imu_df['_time'])
+        imu_df.sort_values('_time', inplace=True)
+        imu_df.set_index('_time', inplace=True)
+        common_index = imu_df.index  # imu 데이터의 원래 인덱스를 그대로 사용
+        imu_sync = imu_df.copy().reset_index()
+        sync_data['imu'] = imu_sync
+        self.logger.info(f"Synchronized imu data: new shape {imu_sync.shape}")
+        # 2. 다른 센서 데이터는 imu의 common_index를 기준으로 재인덱싱
+        for sensor_type, df in data.items():
+            if sensor_type == 'imu':
+                continue
+            df['_time'] = pd.to_datetime(df['_time'])
+            df.sort_values('_time', inplace=True)
+            df.set_index('_time', inplace=True)
+            # imu의 인덱스를 기준으로 재인덱싱 후 선형 보간, ffill, bfill, fillna(0)
+            df_sync = df.reindex(common_index).interpolate(method='linear').ffill().bfill().fillna(0)
+            if 'simulation_id' in df_sync.columns:
+                df_sync['simulation_id'] = df_sync['simulation_id'].ffill().bfill().fillna(0)
+            else:
+                df_sync['simulation_id'] = 0
+            df_sync = df_sync.reset_index()
+            sync_data[sensor_type] = df_sync
+            self.logger.info(f"Synchronized {sensor_type} data: new shape {df_sync.shape}")
+        return sync_data
+
+    def _normalize_data(self, data: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict]:
+        normalized_data = {}
+        scaler_params = {}
+        feature_range = tuple(self.config['filter']['normalization']['feature_range'])
+        for sensor_type, df in data.items():
+            self.logger.info(f"Normalizing {sensor_type} data")
+            df_grouped = df.groupby('simulation_id')
+            normalized_dfs = []
+            for sim_id, group in df_grouped:
+                scaler = MinMaxScaler(feature_range=feature_range)
+                features = self.config['fields'][sensor_type]
+                # Fit the scaler
+                scaler.fit(group[features])
+                normalized_values = scaler.transform(group[features])
+                # For features with zero range, set normalized value to 0
+                diff = scaler.data_max_ - scaler.data_min_
+                for col_idx, d in enumerate(diff):
+                    if d == 0:
+                        normalized_values[:, col_idx] = 0
+                normalized_df = pd.DataFrame(normalized_values, columns=features, index=group.index)
+                normalized_df['simulation_id'] = sim_id
+                normalized_dfs.append(normalized_df)
+                if sensor_type not in scaler_params:
+                    scaler_params[sensor_type] = []
+                scaler_params[sensor_type].append({
+                    'simulation_id': sim_id,
+                    'min': scaler.data_min_.tolist(),
+                    'max': scaler.data_max_.tolist(),
+                    'feature_names': features
+                })
+            if normalized_dfs:
+                normalized_data[sensor_type] = pd.concat(normalized_dfs)
+            else:
+                raise ValueError(f"No normalized groups for sensor {sensor_type}; cannot concatenate.")
+            self.logger.info(f"Normalized {len(normalized_dfs)} simulation groups for {sensor_type}")
+        return normalized_data, scaler_params
+
+    def _create_sequences(self, data: Dict[str, pd.DataFrame]) -> Tuple[np.ndarray, np.ndarray]:
+        sequence_length = self.config['filter']['data_processing']['sequence_length']
+        stride = self.config['filter']['data_processing']['stride']
+        valid_features = []
+        sim_id_df = None
+        for sensor_type, df in data.items():
+            if not df.empty:
+                feature_df = df.drop('simulation_id', axis=1)
+                feature_df.columns = [f"{sensor_type}_{col}" for col in feature_df.columns]
+                valid_features.append(feature_df)
+                if sim_id_df is None:
+                    sim_id_df = df[['simulation_id']]
+        if not valid_features or sim_id_df is None:
+            raise ValueError("No valid data to create sequences")
+        combined_features = pd.concat(valid_features, axis=1)
+        combined_data = pd.concat([sim_id_df, combined_features], axis=1)
         self.logger.info(f"Combined data shape: {combined_data.shape}")
-        
-        # 시퀀스 생성
         sequences = []
-        for i in range(0, len(combined_data) - sequence_length, stride):
-            sequence = combined_data.iloc[i:i + sequence_length].values
-            sequences.append(sequence)
-            
-        sequences = np.array(sequences)
-        self.logger.info(f"Created sequences shape: {sequences.shape}")
-        
-        return sequences
+        sequence_sim_ids = []
+        for sim_id, group in combined_data.groupby('simulation_id'):
+            self.logger.info(f"Creating sequences for simulation {sim_id}")
+            group = group.sort_index()
+            for i in range(0, len(group) - sequence_length + 1, stride):
+                sequence = group.iloc[i:i + sequence_length].drop('simulation_id', axis=1).values
+                sequences.append(sequence)
+                sequence_sim_ids.append(sim_id)
+            self.logger.info(f"Created {len(range(0, len(group) - sequence_length + 1, stride))} sequences for simulation {sim_id}")
+        return np.array(sequences), np.array(sequence_sim_ids)
 
-   def _shuffle_data(self, sequences: np.ndarray) -> np.ndarray:
-       """Shuffle sequences randomly"""
-       indices = np.arange(sequences.shape[0])
-       np.random.shuffle(indices)
-       shuffled_sequences = sequences[indices]
-       
-       self.logger.info(f"Data shuffled: {sequences.shape[0]} sequences")
-       
-       return shuffled_sequences
+    def _shuffle_data(self, sequences: np.ndarray, sim_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        unique_ids = np.unique(sim_ids)
+        np.random.shuffle(unique_ids)
+        new_sequences = []
+        new_sim_ids = []
+        for uid in unique_ids:
+            indices = np.where(sim_ids == uid)[0]
+            new_sequences.extend(sequences[indices])
+            new_sim_ids.extend(sim_ids[indices])
+            self.logger.info(f"Simulation {uid}: {len(indices)} sequences added")
+        return np.array(new_sequences), np.array(new_sim_ids)
 
-   def _save_processed_data(self, sequences: np.ndarray, mode: str):
-       """Save processed data"""
-       save_path = Path(self.config['paths']['base_dir'])
-       
-       # numpy 형식으로 저장
-       np.save(save_path / f'{mode}_sequences.npy', sequences)
-       
-       # CSV 형식으로 저장 (LSTM용)
-       reshaped_data = sequences.reshape(-1, sequences.shape[-1])
-       feature_names = self._get_feature_names()
-       
-       pd.DataFrame(reshaped_data, columns=feature_names).to_csv(
-           save_path / f'{mode}_data.csv',
-           index=False
-       )
+    def _save_processed_data(self, sequences: np.ndarray, mode: str) -> None:
+        save_path = Path(self.config['save']['base_dir'])
+        save_path.mkdir(parents=True, exist_ok=True)
+        np.save(save_path / f'{mode}_sequences.npy', sequences)
+        reshaped_data = sequences.reshape(-1, sequences.shape[-1])
+        feature_names = self._get_feature_names()
+        pd.DataFrame(reshaped_data, columns=feature_names).to_csv(save_path / f'{mode}_data.csv', index=False)
+        self.logger.info(f"Processed data saved at {save_path}")
 
-   def _save_scaler_params(self, scaler_params: Dict):
-       """Save scaling parameters"""
-       save_path = Path(self.config['paths']['base_dir']) / self.config['paths']['scaler_params']
-       with open(save_path, 'w') as f:
-           json.dump(scaler_params, f, indent=2)
+    def _save_scaler_params(self, scaler_params: Dict) -> None:
+        save_path = Path(self.config['save']['base_dir']) / self.config['filter']['normalization']['params_path']
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(save_path, 'w') as f:
+            json.dump(scaler_params, f, indent=2)
+        self.logger.info(f"Scaler parameters saved at {save_path}")
 
-   def _get_feature_names(self) -> List[str]:
-       """Get list of all feature names"""
-       feature_names = []
-       for sensor_type in self.config['lstm_data']['feature_order']:
-           if sensor_type.endswith('_features'):
-               sensor_type = sensor_type[:-9]  # Remove '_features' suffix
-           if sensor_type in self.config['sensors']['primary']:
-               feature_names.extend(self.config['sensors']['primary'][sensor_type]['features'])
-           elif sensor_type in self.config['sensors']['secondary']:
-               feature_names.extend(self.config['sensors']['secondary'][sensor_type]['features'])
-       return feature_names
+    def _get_feature_names(self) -> List[str]:
+        feature_names = []
+        for sensor_type in self.config['fields']:
+            for feature in self.config['fields'][sensor_type]:
+                feature_names.append(f"{sensor_type}_{feature}")
+        return feature_names
 
-   def _apply_normalization(self, data: Dict[str, pd.DataFrame], scaler_params: Dict) -> Dict[str, pd.DataFrame]:
-       """Apply saved normalization parameters to new data"""
-       normalized_data = {}
-       
-       for sensor_type, df in data.items():
-           if sensor_type in scaler_params:
-               params = scaler_params[sensor_type]
-               features = params['feature_names']
-               
-               # 스케일러 재생성
-               scaler = MinMaxScaler()
-               scaler.min_ = np.array(params['min'])
-               scaler.scale_ = (np.array(params['max']) - scaler.min_)
-               
-               # 정규화 적용
-               normalized_values = scaler.transform(df[features])
-               normalized_df = pd.DataFrame(
-                   normalized_values,
-                   columns=features,
-                   index=df.index
-               )
-               
-               normalized_data[sensor_type] = normalized_df
-       
-       return normalized_data
+    def _apply_normalization(self, data: Dict[str, pd.DataFrame], scaler_params: Dict) -> Dict[str, pd.DataFrame]:
+        normalized_data = {}
+        feature_range = tuple(self.config['filter']['normalization']['feature_range'])
+        for sensor_type, df in data.items():
+            normalized_dfs = []
+            for sim_params in scaler_params[sensor_type]:
+                sim_id = sim_params['simulation_id']
+                sim_data = df[df['simulation_id'] == sim_id]
+                if sim_data.empty:
+                    continue
+                data_min = np.array(sim_params['min'])
+                data_max = np.array(sim_params['max'])
+                scale = (feature_range[1] - feature_range[0]) / (data_max - data_min)
+                min_val = feature_range[0] - data_min * scale
+                scaler = MinMaxScaler(feature_range=feature_range)
+                scaler.scale_ = scale
+                scaler.min_ = min_val
+                features = sim_params['feature_names']
+                normalized_values = scaler.transform(sim_data[features])
+                # For constant features, set normalized value to 0
+                diff = data_max - data_min
+                for col_idx, d in enumerate(diff):
+                    if d == 0:
+                        normalized_values[:, col_idx] = 0
+                normalized_df = pd.DataFrame(normalized_values, columns=features, index=sim_data.index)
+                normalized_df['simulation_id'] = sim_id
+                normalized_dfs.append(normalized_df)
+            if normalized_dfs:
+                normalized_data[sensor_type] = pd.concat(normalized_dfs)
+                self.logger.info(f"Applied normalization for {sensor_type}")
+            else:
+                self.logger.warning(f"No data found for sensor {sensor_type} during inference normalization")
+        return normalized_data
 
-   def cleanup(self):
-       """Cleanup resources"""
-       if hasattr(self, 'client'):
-           self.client.close()
-       self.logger.info("Resources cleaned up")
+    def cleanup(self) -> None:
+        """리소스 정리 (InfluxDB 클라이언트 종료)"""
+        if hasattr(self, 'client'):
+            self.client.close()
+        self.logger.info("Resources cleaned up")
 
 if __name__ == "__main__":
-   try:
-       filter = DroneDataFilter()
-       data = filter.get_all_sensor_data()
-       sequences, scaler_params = filter.filter_batch(data)
-       filter.cleanup()
-   except Exception as e:
-       logging.error(f"Error in main execution: {e}", exc_info=True)
+    try:
+        drone_filter = DroneDataFilter()
+        data = drone_filter.get_all_sensor_data()
+        sequences, sim_ids, scaler_params = drone_filter.filter_batch(data)
+        drone_filter.cleanup()
+    except Exception as e:
+        logging.error(f"Error in main execution: {e}", exc_info=True)
