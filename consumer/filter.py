@@ -162,34 +162,41 @@ class DroneDataFilter:
         return clean_data
 
     def _synchronize_data(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        self.logger.info("Starting sensor data synchronization using imu timestamps as base")
+        # 모든 센서 데이터의 _time을 datetime으로 변환 및 정렬
+        for sensor_type, df in data.items():
+            df['_time'] = pd.to_datetime(df['_time'])
+            df.sort_values('_time', inplace=True)
+        
+        # imu 데이터가 반드시 존재해야 함 (기준 센서)
+        if 'imu' not in data or data['imu'].empty:
+            raise ValueError("IMU 데이터가 존재하지 않아 기준 인덱스를 생성할 수 없습니다.")
+        base_df = data['imu'].copy()  # imu 데이터가 기준
+        base_df.reset_index(drop=True, inplace=True)
+        base_times = base_df['_time']
+        self.logger.info(f"Base sensor (imu) data shape: {base_df.shape}")
+        
+        # tolerance: merge_asof 적용 시 허용 시간차 (설정 파일에서 지정, 예: '25ms')
+        tolerance = pd.Timedelta(self.config['filter']['data_processing'].get('tolerance', '25ms'))
+        
         sync_data = {}
-        # 1. imu 데이터를 기준으로 공통 인덱스 생성 (원래 imu 인덱스 사용)
-        imu_df = data.get('imu')
-        if imu_df is None or imu_df.empty:
-            raise ValueError("imu data is missing or empty. Cannot determine common time index.")
-        imu_df['_time'] = pd.to_datetime(imu_df['_time'])
-        imu_df.sort_values('_time', inplace=True)
-        imu_df.set_index('_time', inplace=True)
-        common_index = imu_df.index  # imu 데이터의 원래 인덱스를 그대로 사용
-        imu_sync = imu_df.copy().reset_index()
-        sync_data['imu'] = imu_sync
-        self.logger.info(f"Synchronized imu data: new shape {imu_sync.shape}")
-        # 2. 다른 센서 데이터는 imu의 common_index를 기준으로 재인덱싱
+        # imu는 기준 데이터 그대로 사용
+        sync_data['imu'] = base_df
+        
+        # 나머지 센서들에 대해 imu 타임스탬프를 기준으로 merge_asof 적용
         for sensor_type, df in data.items():
             if sensor_type == 'imu':
                 continue
-            df['_time'] = pd.to_datetime(df['_time'])
-            df.sort_values('_time', inplace=True)
-            df.set_index('_time', inplace=True)
-            # imu의 인덱스를 기준으로 재인덱싱 후 선형 보간, ffill, bfill, fillna(0)
-            df_sync = df.reindex(common_index).interpolate(method='linear').ffill().bfill().fillna(0)
-            if 'simulation_id' in df_sync.columns:
-                df_sync['simulation_id'] = df_sync['simulation_id'].ffill().bfill().fillna(0)
-            else:
-                df_sync['simulation_id'] = 0
-            df_sync = df_sync.reset_index()
-            sync_data[sensor_type] = df_sync
-            self.logger.info(f"Synchronized {sensor_type} data: new shape {df_sync.shape}")
+            self.logger.info(f"Synchronizing sensor: {sensor_type} using imu timestamps as base")
+            base_times_df = pd.DataFrame({'_time': base_times})
+            # merge_asof: imu의 각 타임스탬프에 대해, 해당 센서 데이터에서 가장 가까운 값을 선택
+            merged = pd.merge_asof(base_times_df, df, on='_time', tolerance=tolerance, direction='nearest')
+            # 결측값 보간: 앞/뒤 값 채우기
+            merged = merged.fillna(method='ffill').fillna(method='bfill')
+            if 'simulation_id' not in merged.columns:
+                merged['simulation_id'] = 0
+            sync_data[sensor_type] = merged
+            self.logger.info(f"Synchronized {sensor_type} data: shape {merged.shape}")
         return sync_data
 
     def _normalize_data(self, data: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict]:
@@ -203,10 +210,9 @@ class DroneDataFilter:
             for sim_id, group in df_grouped:
                 scaler = MinMaxScaler(feature_range=feature_range)
                 features = self.config['fields'][sensor_type]
-                # Fit the scaler
                 scaler.fit(group[features])
                 normalized_values = scaler.transform(group[features])
-                # For features with zero range, set normalized value to 0
+                # 만약 feature의 범위가 0이면, 해당 column은 0으로 대체
                 diff = scaler.data_max_ - scaler.data_min_
                 for col_idx, d in enumerate(diff):
                     if d == 0:
@@ -312,7 +318,6 @@ class DroneDataFilter:
                 scaler.min_ = min_val
                 features = sim_params['feature_names']
                 normalized_values = scaler.transform(sim_data[features])
-                # For constant features, set normalized value to 0
                 diff = data_max - data_min
                 for col_idx, d in enumerate(diff):
                     if d == 0:
