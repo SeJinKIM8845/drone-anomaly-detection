@@ -148,15 +148,15 @@
 ## 실행 방법
 
 1. **Zookeeper 시작**  
-
-$ZOOKEEPER_HOME/bin/zkServer.sh start
-
+``` bash
+  $ZOOKEEPER_HOME/bin/zkServer.sh start
+```
 2. **Kafka 브로커 시작**
-   
+``` bash
 $KAFKA_HOME/bin/kafka-server-start.sh -daemon $KAFKA_HOME/config/server.properties
-
+```
 3. **Consumer 실행**
-   
+``` bash
 python3 consumer.py
-
+```
    
