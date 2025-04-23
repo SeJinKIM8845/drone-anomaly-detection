@@ -146,3 +146,22 @@
 - **데이터 시각화:** Grafana
 
 ---
+실행 방법
+Zookeeper 시작
+
+bash
+복사
+편집
+$ZOOKEEPER_HOME/bin/zkServer.sh start
+Kafka 브로커 시작
+
+bash
+복사
+편집
+$KAFKA_HOME/bin/kafka-server-start.sh -daemon $KAFKA_HOME/config/server.properties
+Consumer 실행
+
+bash
+복사
+편집
+python3 consumer.py
